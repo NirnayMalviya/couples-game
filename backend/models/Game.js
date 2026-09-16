@@ -28,16 +28,14 @@ const gameSchema = new mongoose.Schema(
     packageId: { type: String, required: true },
     playerIds: { type: [String], required: true }, // [player1Id, player2Id]
     questionIds: { type: [mongoose.Schema.Types.ObjectId], ref: "Question", required: true },
-    currentQuestionIndex: { type: Number, default: 0 },
+    // ANSWERING: both players independently answering all questions.
+    // GUESSING: both answered; now independently guessing all questions.
+    // REVEAL: both guessed; per-question breakdown has been sent.
+    // FINAL_RESULT: round over, winner/tie computed.
     state: {
       type: String,
-      enum: [
-        "QUESTION_ACTIVE",
-        "GUESSING_PHASE",
-        "ANSWER_REVEAL",
-        "FINAL_RESULT",
-      ],
-      default: "QUESTION_ACTIVE",
+      enum: ["ANSWERING", "GUESSING", "REVEAL", "FINAL_RESULT"],
+      default: "ANSWERING",
     },
     answers: { type: [answerSchema], default: [] },
     guesses: { type: [guessSchema], default: [] },

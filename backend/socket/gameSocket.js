@@ -6,6 +6,9 @@ import { selectQuestionsForCouple } from "../utils/questionSelector.js";
 // socketId -> { roomId, playerId }  (in-memory; fine for a single instance)
 const socketSessions = new Map();
 
+const QUESTIONS_PER_ROUND = 5;
+const POINTS_PER_QUESTION = 2; // 5 questions × 2 = 10 max per package
+
 const toPublicQuestion = (q, index, total) => ({
   index,
   total,
@@ -17,23 +20,59 @@ const toPublicQuestion = (q, index, total) => ({
   options: q.options.map((o) => ({ id: o.id, text: o.text })),
 });
 
-async function currentQuestionDoc(game) {
-  const qid = game.questionIds[game.currentQuestionIndex];
-  return Question.findById(qid);
+async function publicQuestionsFor(game) {
+  const docs = await Question.find({ _id: { $in: game.questionIds } });
+  // Preserve the original round order, not whatever order Mongo returns.
+  const byId = new Map(docs.map((d) => [d._id.toString(), d]));
+  const ordered = game.questionIds.map((id) => byId.get(id.toString()));
+  return ordered.map((q, i) => toPublicQuestion(q, i, ordered.length));
+}
+
+function buildResults(game) {
+  const [p1, p2] = game.playerIds;
+  const results = { [p1]: [], [p2]: [] };
+  for (const qId of game.questionIds.map((id) => id.toString())) {
+    for (const pId of [p1, p2]) {
+      const g = game.guesses.find((g) => g.questionId.toString() === qId && g.playerId === pId);
+      const otherId = otherPlayerId(game, pId);
+      const actual = game.answers.find((a) => a.questionId.toString() === qId && a.playerId === otherId);
+      results[pId].push({
+        questionId: qId,
+        guessedOptionId: g?.guessedOptionId,
+        actualPartnerOptionId: actual?.optionId,
+        isCorrect: !!g?.isCorrect,
+        pointsEarned: g?.points || 0,
+      });
+    }
+  }
+  return results;
 }
 
 function otherPlayerId(game, playerId) {
   return game.playerIds.find((id) => id !== playerId);
 }
 
-async function finalizeGame(io, room, game) {
+function roomPlayersPayload(room) {
+  return room.players.map((p) => ({
+    playerId: p.playerId,
+    nickname: p.nickname,
+    avatar: p.avatar,
+    isHost: p.isHost,
+    connected: p.connected,
+  }));
+}
+
+async function finalizeRound(io, room, game) {
   const [p1, p2] = game.playerIds;
   const s1 = game.scores[p1] || 0;
   const s2 = game.scores[p2] || 0;
 
-  game.state = "FINAL_RESULT";
-  game.completedAt = new Date();
-  await game.save();
+  const finished = await Game.findOneAndUpdate(
+    { _id: game._id, state: "REVEAL" },
+    { $set: { state: "FINAL_RESULT", completedAt: new Date() } },
+    { new: true }
+  );
+  if (!finished) return; // already finalized by the other player's click
 
   room.status = "COMPLETED";
   await room.save();
@@ -44,7 +83,7 @@ async function finalizeGame(io, room, game) {
     scores: game.scores,
     winnerPlayerId,
     isPerfectMatch: s1 === s2,
-    maxPossible: game.questionIds.length * 10,
+    maxPossible: game.questionIds.length * POINTS_PER_QUESTION,
   });
 }
 
@@ -66,24 +105,34 @@ export function registerGameSocket(io) {
         io.to(room.code).emit("room-update", {
           status: room.status,
           packageId: room.packageId,
-          players: room.players.map((p) => ({ playerId: p.playerId, nickname: p.nickname, avatar: p.avatar, isHost: p.isHost, connected: p.connected })),
+          players: roomPlayersPayload(room),
         });
 
         if (wasReconnect) io.to(room.code).emit("partner-reconnected", { playerId });
 
-        // Resume in-progress game state for this socket, if any.
+        // Resume in-progress round for this socket, if any — send the full
+        // question set plus which ones this player has already answered
+        // and guessed, so the client can restore the right local step.
         if (room.activeGameId) {
           const game = await Game.findById(room.activeGameId);
           if (game && game.state !== "FINAL_RESULT") {
-            const qDoc = await currentQuestionDoc(game);
-            socket.emit("resume-game", {
+            const questions = await publicQuestionsFor(game);
+            const answeredIds = game.answers.filter((a) => a.playerId === playerId).map((a) => a.questionId.toString());
+            const guessedIds = game.guesses.filter((g) => g.playerId === playerId).map((g) => g.questionId.toString());
+            const payload = {
               gameId: game._id,
               state: game.state,
               scores: game.scores,
-              question: toPublicQuestion(qDoc, game.currentQuestionIndex, game.questionIds.length),
-              hasAnswered: game.answers.some((a) => a.questionId.toString() === qDoc._id.toString() && a.playerId === playerId),
-              hasGuessed: game.guesses.some((g) => g.questionId.toString() === qDoc._id.toString() && g.playerId === playerId),
-            });
+              questions,
+              answeredIds,
+              guessedIds,
+            };
+            if (game.state === "REVEAL") {
+              const results = buildResults(game);
+              payload.revealResults = results[playerId];
+              payload.maxPossible = game.questionIds.length * POINTS_PER_QUESTION;
+            }
+            socket.emit("resume-game", payload);
           }
         }
       } catch (err) {
@@ -99,7 +148,7 @@ export function registerGameSocket(io) {
       io.to(room.code).emit("room-update", {
         status: room.status,
         packageId: room.packageId,
-        players: room.players.map((p) => ({ playerId: p.playerId, nickname: p.nickname, avatar: p.avatar, isHost: p.isHost, connected: p.connected })),
+        players: roomPlayersPayload(room),
       });
     });
 
@@ -113,7 +162,7 @@ export function registerGameSocket(io) {
         const [p1, p2] = room.players;
         let questions;
         try {
-          questions = await selectQuestionsForCouple(p1.playerId, p2.playerId, room.packageId, 10);
+          questions = await selectQuestionsForCouple(p1.playerId, p2.playerId, room.packageId, QUESTIONS_PER_ROUND);
         } catch (err) {
           if (err.code === "PACKAGE_EXHAUSTED") {
             return io.to(room.code).emit("package-exhausted", {
@@ -129,8 +178,7 @@ export function registerGameSocket(io) {
           packageId: room.packageId,
           playerIds: [p1.playerId, p2.playerId],
           questionIds: questions.map((q) => q._id),
-          currentQuestionIndex: 0,
-          state: "QUESTION_ACTIVE",
+          state: "ANSWERING",
           scores: { [p1.playerId]: 0, [p2.playerId]: 0 },
         });
 
@@ -141,75 +189,74 @@ export function registerGameSocket(io) {
         io.to(room.code).emit("game-started", {
           gameId: game._id,
           scores: game.scores,
-          question: toPublicQuestion(questions[0], 0, questions.length),
+          questions: questions.map((q, i) => toPublicQuestion(q, i, questions.length)),
         });
       } catch (err) {
         socket.emit("error-toast", { message: "Couldn't start the game — please try again." });
       }
     });
 
+    // Both partners answer all QUESTIONS_PER_ROUND questions independently,
+    // at their own pace — no per-question waiting. Once BOTH have answered
+    // every question, the round moves to the guessing phase for everyone.
     socket.on("submit-answer", async ({ roomId, gameId, questionId, optionId, playerId }) => {
       const room = await Room.findById(roomId);
       if (!room) return;
 
-      // Atomic: only pushes if the game is still QUESTION_ACTIVE and this
-      // player hasn't already answered this question. MongoDB serializes
-      // writes to a single document, so when both partners submit near
-      // simultaneously, the second write always sees the first one's
-      // result — no dropped submissions.
       const game = await Game.findOneAndUpdate(
         {
           _id: gameId,
-          state: "QUESTION_ACTIVE",
+          state: "ANSWERING",
           answers: { $not: { $elemMatch: { questionId, playerId } } },
         },
         { $push: { answers: { questionId, playerId, optionId, submittedAt: new Date() } } },
         { new: true }
       );
-      if (!game) return; // wrong state, or this player already answered
+      if (!game) return; // wrong state, or already answered this one
 
-      const bothAnswered = game.answers.filter((a) => a.questionId.toString() === questionId).length === 2;
-
-      if (!bothAnswered) {
-        io.to(room.code).emit("player-locked-answer", { playerId });
-        return;
+      const myCount = game.answers.filter((a) => a.playerId === playerId).length;
+      if (myCount === QUESTIONS_PER_ROUND) {
+        io.to(room.code).emit("player-finished-answering", { playerId });
       }
 
-      const revealed = await Game.findOneAndUpdate(
-        { _id: gameId, state: "QUESTION_ACTIVE" },
-        { $set: { state: "GUESSING_PHASE" } },
+      const [p1, p2] = game.playerIds;
+      const p1Done = game.answers.filter((a) => a.playerId === p1).length === QUESTIONS_PER_ROUND;
+      const p2Done = game.answers.filter((a) => a.playerId === p2).length === QUESTIONS_PER_ROUND;
+      if (!(p1Done && p2Done)) return;
+
+      const advanced = await Game.findOneAndUpdate(
+        { _id: gameId, state: "ANSWERING" },
+        { $set: { state: "GUESSING" } },
         { new: true }
       );
-      if (!revealed) return; // another event already advanced this game
+      if (!advanced) return; // another event already advanced this game
 
-      const qDoc = await Question.findById(questionId);
+      const questions = await publicQuestionsFor(advanced);
       io.to(room.code).emit("guessing-phase", {
         message: "Both of you are ready! Let's see if you actually know them 👀",
-        question: toPublicQuestion(qDoc, revealed.currentQuestionIndex, revealed.questionIds.length),
+        questions,
       });
     });
 
+    // Same independent-pace pattern for guesses. Partner answers are
+    // already final by the time GUESSING starts, so scoring is safe to
+    // compute inline before the atomic write.
     socket.on("submit-guess", async ({ roomId, gameId, questionId, guessedOptionId, playerId }) => {
       const room = await Room.findById(roomId);
       if (!room) return;
 
-      // Need the partner's actual answer to score this guess before we
-      // can write it — safe to read here since answers are already final
-      // by the time GUESSING_PHASE starts.
       const gameBeforeGuess = await Game.findById(gameId);
-      if (!gameBeforeGuess || gameBeforeGuess.state !== "GUESSING_PHASE") return;
+      if (!gameBeforeGuess || gameBeforeGuess.state !== "GUESSING") return;
 
       const partnerId = otherPlayerId(gameBeforeGuess, playerId);
       const partnerAnswer = gameBeforeGuess.answers.find((a) => a.questionId.toString() === questionId && a.playerId === partnerId);
       const isCorrect = !!partnerAnswer && partnerAnswer.optionId === guessedOptionId;
-      const points = isCorrect ? 10 : 0;
+      const points = isCorrect ? POINTS_PER_QUESTION : 0;
 
-      // Atomic push + score increment in one write, guarded so a duplicate
-      // guess from the same player can't double-count.
       const game = await Game.findOneAndUpdate(
         {
           _id: gameId,
-          state: "GUESSING_PHASE",
+          state: "GUESSING",
           guesses: { $not: { $elemMatch: { questionId, playerId } } },
         },
         {
@@ -218,61 +265,42 @@ export function registerGameSocket(io) {
         },
         { new: true }
       );
-      if (!game) return; // wrong state, or this player already guessed
+      if (!game) return; // wrong state, or already guessed this one
 
-      io.to(room.code).emit("player-locked-guess", { playerId });
+      const myCount = game.guesses.filter((g) => g.playerId === playerId).length;
+      if (myCount === QUESTIONS_PER_ROUND) {
+        io.to(room.code).emit("player-finished-guessing", { playerId });
+      }
 
-      const bothGuessed = game.guesses.filter((g) => g.questionId.toString() === questionId).length === 2;
-      if (!bothGuessed) return;
+      const [p1, p2] = game.playerIds;
+      const p1Done = game.guesses.filter((g) => g.playerId === p1).length === QUESTIONS_PER_ROUND;
+      const p2Done = game.guesses.filter((g) => g.playerId === p2).length === QUESTIONS_PER_ROUND;
+      if (!(p1Done && p2Done)) return;
 
       const revealed = await Game.findOneAndUpdate(
-        { _id: gameId, state: "GUESSING_PHASE" },
-        { $set: { state: "ANSWER_REVEAL" } },
+        { _id: gameId, state: "GUESSING" },
+        { $set: { state: "REVEAL" } },
         { new: true }
       );
       if (!revealed) return; // another event already advanced this game
 
-      const results = {};
-      for (const g of revealed.guesses.filter((g) => g.questionId.toString() === questionId)) {
-        const pId = otherPlayerId(revealed, g.playerId);
-        const actual = revealed.answers.find((a) => a.questionId.toString() === questionId && a.playerId === pId);
-        results[g.playerId] = {
-          guessedOptionId: g.guessedOptionId,
-          actualPartnerOptionId: actual?.optionId,
-          isCorrect: g.isCorrect,
-          pointsEarned: g.points,
-        };
-      }
+      const results = buildResults(revealed);
 
-      io.to(room.code).emit("reveal", {
-        questionId,
+      io.to(room.code).emit("reveal-all", {
         results,
         scores: revealed.scores,
-        isLastQuestion: revealed.currentQuestionIndex === revealed.questionIds.length - 1,
+        maxPossible: revealed.questionIds.length * POINTS_PER_QUESTION,
       });
     });
 
-    socket.on("next-question", async ({ roomId, gameId }) => {
+    // Either player can move the round on from the breakdown screen to the
+    // final scoreboard — first one wins the race, the other's call is a
+    // harmless no-op since the state guard has already flipped.
+    socket.on("finish-round", async ({ roomId, gameId }) => {
       const room = await Room.findById(roomId);
       const game = await Game.findById(gameId);
-      if (!room || !game || game.state !== "ANSWER_REVEAL") return;
-
-      const nextIndex = game.currentQuestionIndex + 1;
-      if (nextIndex >= game.questionIds.length) {
-        await finalizeGame(io, room, game);
-        return;
-      }
-
-      game.currentQuestionIndex = nextIndex;
-      game.state = "QUESTION_ACTIVE";
-      await game.save();
-
-      const qDoc = await Question.findById(game.questionIds[nextIndex]);
-      io.to(room.code).emit("game-started", {
-        gameId: game._id,
-        scores: game.scores,
-        question: toPublicQuestion(qDoc, nextIndex, game.questionIds.length),
-      });
+      if (!room || !game || game.state !== "REVEAL") return;
+      await finalizeRound(io, room, game);
     });
 
     socket.on("play-again", async ({ roomId }) => {
@@ -285,7 +313,7 @@ export function registerGameSocket(io) {
       io.to(room.code).emit("room-update", {
         status: room.status,
         packageId: room.packageId,
-        players: room.players.map((p) => ({ playerId: p.playerId, nickname: p.nickname, avatar: p.avatar, isHost: p.isHost, connected: p.connected })),
+        players: roomPlayersPayload(room),
       });
     });
 
