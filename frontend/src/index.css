@@ -4,12 +4,43 @@
 
 html, body, #root { height: 100%; }
 
+html { scroll-behavior: smooth; }
+
 body {
   font-family: "Manrope", sans-serif;
   color: #3D1735;
+  overflow-x: hidden;
 }
 
 .font-display { font-family: "Fraunces", serif; }
+
+::selection { background: rgba(228,85,122,0.25); color: #3D1735; }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgba(228,85,122,0.35);
+  border-radius: 999px;
+  border: 2px solid #FBF5F1;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(228,85,122,0.55); }
+
+/* Reusable "press" feel for buttons that don't use Framer Motion whileTap
+   directly — keeps the same feel everywhere. */
+.btn-press { transition: transform 0.12s ease; }
+.btn-press:active:not(:disabled) { transform: scale(0.96); }
+
+/* Gentle shimmer sweep for primary CTA buttons — alive without being loud. */
+.shimmer-sweep { position: relative; overflow: hidden; }
+.shimmer-sweep::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image: linear-gradient(110deg, transparent 30%, rgba(255,255,255,0.35) 50%, transparent 70%);
+  background-size: 200% 100%;
+  animation: shimmer 2.6s linear infinite;
+  pointer-events: none;
+}
 
 /* Torn-postcard corner treatment used for question + result cards,
    instead of a generic flat rounded-rectangle. */
@@ -18,6 +49,7 @@ body {
   background: #fff;
   border-radius: 22px;
   box-shadow: 0 2px 0 rgba(61,23,53,0.08), 0 14px 24px -12px rgba(61,23,53,0.28);
+  transition: box-shadow 0.3s ease, transform 0.3s ease;
 }
 .postcard::before {
   content: "";
@@ -28,7 +60,8 @@ body {
   pointer-events: none;
 }
 
-/* Dotted "long distance" connector line between the two player avatars */
+/* Dotted "long distance" connector line between the two player avatars,
+   with a slow heartbeat pulse on the heart to feel alive. */
 .connector-line {
   flex: 1;
   height: 0;
@@ -45,13 +78,31 @@ body {
   color: #E4557A;
   background: #FBF5F1;
   padding: 0 4px;
+  animation: heartbeat 2.4s ease-in-out infinite;
+  display: inline-block;
 }
 
 .option-btn {
-  transition: transform 0.15s ease, box-shadow 0.15s ease, background-color 0.15s ease, border-color 0.15s ease;
+  transition: transform 0.16s ease, box-shadow 0.16s ease, background-color 0.16s ease, border-color 0.16s ease;
 }
 .option-btn:hover:not(:disabled) {
-  transform: translateY(-2px) scale(1.01);
+  transform: translateY(-3px) scale(1.015);
+  box-shadow: 0 10px 22px -10px rgba(61,23,53,0.25);
+}
+.option-btn:active:not(:disabled) {
+  transform: translateY(-1px) scale(0.99);
+}
+
+/* Confetti piece — spawned dynamically by the Confetti component */
+.confetti-piece {
+  position: absolute;
+  top: -10px;
+  will-change: transform, opacity;
+  animation: confetti-fall linear forwards;
+}
+@keyframes confetti-fall {
+  0% { transform: translateY(0) rotate(0deg); opacity: 1; }
+  100% { transform: translateY(110vh) rotate(540deg); opacity: 0; }
 }
 
 @media (prefers-reduced-motion: reduce) {
