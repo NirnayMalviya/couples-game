@@ -150,14 +150,23 @@ export function registerGameSocket(io) {
 
     socket.on("submit-answer", async ({ roomId, gameId, questionId, optionId, playerId }) => {
       const room = await Room.findById(roomId);
-      const game = await Game.findById(gameId);
-      if (!room || !game || game.state !== "QUESTION_ACTIVE") return;
+      if (!room) return;
 
-      const already = game.answers.some((a) => a.questionId.toString() === questionId && a.playerId === playerId);
-      if (already) return;
-
-      game.answers.push({ questionId, playerId, optionId });
-      await game.save();
+      // Atomic: only pushes if the game is still QUESTION_ACTIVE and this
+      // player hasn't already answered this question. MongoDB serializes
+      // writes to a single document, so when both partners submit near
+      // simultaneously, the second write always sees the first one's
+      // result — no dropped submissions.
+      const game = await Game.findOneAndUpdate(
+        {
+          _id: gameId,
+          state: "QUESTION_ACTIVE",
+          answers: { $not: { $elemMatch: { questionId, playerId } } },
+        },
+        { $push: { answers: { questionId, playerId, optionId, submittedAt: new Date() } } },
+        { new: true }
+      );
+      if (!game) return; // wrong state, or this player already answered
 
       const bothAnswered = game.answers.filter((a) => a.questionId.toString() === questionId).length === 2;
 
@@ -166,45 +175,67 @@ export function registerGameSocket(io) {
         return;
       }
 
-      game.state = "GUESSING_PHASE";
-      await game.save();
+      const revealed = await Game.findOneAndUpdate(
+        { _id: gameId, state: "QUESTION_ACTIVE" },
+        { $set: { state: "GUESSING_PHASE" } },
+        { new: true }
+      );
+      if (!revealed) return; // another event already advanced this game
+
       const qDoc = await Question.findById(questionId);
       io.to(room.code).emit("guessing-phase", {
         message: "Both of you are ready! Let's see if you actually know them 👀",
-        question: toPublicQuestion(qDoc, game.currentQuestionIndex, game.questionIds.length),
+        question: toPublicQuestion(qDoc, revealed.currentQuestionIndex, revealed.questionIds.length),
       });
     });
 
     socket.on("submit-guess", async ({ roomId, gameId, questionId, guessedOptionId, playerId }) => {
       const room = await Room.findById(roomId);
-      const game = await Game.findById(gameId);
-      if (!room || !game || game.state !== "GUESSING_PHASE") return;
+      if (!room) return;
 
-      const already = game.guesses.some((g) => g.questionId.toString() === questionId && g.playerId === playerId);
-      if (already) return;
+      // Need the partner's actual answer to score this guess before we
+      // can write it — safe to read here since answers are already final
+      // by the time GUESSING_PHASE starts.
+      const gameBeforeGuess = await Game.findById(gameId);
+      if (!gameBeforeGuess || gameBeforeGuess.state !== "GUESSING_PHASE") return;
 
-      const partnerId = otherPlayerId(game, playerId);
-      const partnerAnswer = game.answers.find((a) => a.questionId.toString() === questionId && a.playerId === partnerId);
+      const partnerId = otherPlayerId(gameBeforeGuess, playerId);
+      const partnerAnswer = gameBeforeGuess.answers.find((a) => a.questionId.toString() === questionId && a.playerId === partnerId);
       const isCorrect = !!partnerAnswer && partnerAnswer.optionId === guessedOptionId;
       const points = isCorrect ? 10 : 0;
 
-      game.guesses.push({ questionId, playerId, guessedOptionId, isCorrect, points });
-      game.scores[playerId] = (game.scores[playerId] || 0) + points;
-      game.markModified("scores");
-      await game.save();
+      // Atomic push + score increment in one write, guarded so a duplicate
+      // guess from the same player can't double-count.
+      const game = await Game.findOneAndUpdate(
+        {
+          _id: gameId,
+          state: "GUESSING_PHASE",
+          guesses: { $not: { $elemMatch: { questionId, playerId } } },
+        },
+        {
+          $push: { guesses: { questionId, playerId, guessedOptionId, isCorrect, points, submittedAt: new Date() } },
+          $inc: { [`scores.${playerId}`]: points },
+        },
+        { new: true }
+      );
+      if (!game) return; // wrong state, or this player already guessed
 
       io.to(room.code).emit("player-locked-guess", { playerId });
 
       const bothGuessed = game.guesses.filter((g) => g.questionId.toString() === questionId).length === 2;
       if (!bothGuessed) return;
 
-      game.state = "ANSWER_REVEAL";
-      await game.save();
+      const revealed = await Game.findOneAndUpdate(
+        { _id: gameId, state: "GUESSING_PHASE" },
+        { $set: { state: "ANSWER_REVEAL" } },
+        { new: true }
+      );
+      if (!revealed) return; // another event already advanced this game
 
       const results = {};
-      for (const g of game.guesses.filter((g) => g.questionId.toString() === questionId)) {
-        const pId = otherPlayerId(game, g.playerId);
-        const actual = game.answers.find((a) => a.questionId.toString() === questionId && a.playerId === pId);
+      for (const g of revealed.guesses.filter((g) => g.questionId.toString() === questionId)) {
+        const pId = otherPlayerId(revealed, g.playerId);
+        const actual = revealed.answers.find((a) => a.questionId.toString() === questionId && a.playerId === pId);
         results[g.playerId] = {
           guessedOptionId: g.guessedOptionId,
           actualPartnerOptionId: actual?.optionId,
@@ -216,8 +247,8 @@ export function registerGameSocket(io) {
       io.to(room.code).emit("reveal", {
         questionId,
         results,
-        scores: game.scores,
-        isLastQuestion: game.currentQuestionIndex === game.questionIds.length - 1,
+        scores: revealed.scores,
+        isLastQuestion: revealed.currentQuestionIndex === revealed.questionIds.length - 1,
       });
     });
 
