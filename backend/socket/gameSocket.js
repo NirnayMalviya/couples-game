@@ -164,9 +164,9 @@ export function registerGameSocket(io) {
         try {
           questions = await selectQuestionsForCouple(p1.playerId, p2.playerId, room.packageId, QUESTIONS_PER_ROUND);
         } catch (err) {
-          if (err.code === "PACKAGE_EXHAUSTED") {
+          if (err.code === "PACKAGE_INCOMPLETE") {
             return io.to(room.code).emit("package-exhausted", {
-              message: "You've officially conquered this package! Try another category.",
+              message: "This package isn't fully loaded yet — try another one for now.",
               available: err.available,
             });
           }
